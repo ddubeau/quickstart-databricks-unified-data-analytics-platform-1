@@ -11,6 +11,7 @@ from Workspaces import WorkspacesManager
 from WorkspaceManager import WorkspaceManager
 from VpcEndpoints import VpcEndpointsManager
 from PrivateAccessSettings import PrivateAccessSettingsManager
+from LogDeliveryConfigurations import LogDeliveryConfigurationManager
 
 def timeout(event, context):
     logging.error('Execution is about to time out, sending failure response to CloudFormation')
@@ -39,7 +40,9 @@ def handler(event, context):
         'CREATE_PRIVATE_ACCESS_CONFIGURATION',
         'CREATE_HIPAA_CLUSTER_POLICY',
         'REGISTER_INSTANCE_PROFILE',
-        'CREATE_STARTER_CLUSTER'
+        'CREATE_STARTER_CLUSTER',
+        'CREATE_BILLABLE_USAGE_LOGS_CONFIGURATION',
+        'CREATE_AUDIT_LOGS_CONFIGURATION'
     )
     if 'action' not in event['ResourceProperties'] or event['ResourceProperties']['action'] not in supportedActions:
         cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, reason = 'No supported action specified')
@@ -213,6 +216,31 @@ def handler(event, context):
             elif event['RequestType'] == 'Delete':
                 if physicalResourceId.isnumeric():
                     workspacesManager.delete(int(physicalResourceId))
+
+        #### Log delivery configurations
+
+        # Create configuration for billable usage logs
+        elif action in ('CREATE_BILLABLE_USAGE_LOGS_CONFIGURATION', 'CREATE_AUDIT_LOGS_CONFIGURATION'):
+            logDeliveryConfigurationManager = LogDeliveryConfigurationManager(apiSession)
+            if event['RequestType'] == 'Create':
+                checkForMissingProperties(event, ['config_name', 'credentials_id', 'storage_config_id'])
+                configObject = None
+                if action == 'CREATE_BILLABLE_USAGE_LOGS_CONFIGURATION':
+                    configObject = logDeliveryConfigurationManager.createForBillableUsageLogs(
+                        event['ResourceProperties']['config_name'],
+                        event['ResourceProperties']['credentials_id'],
+                        event['ResourceProperties']['storage_config_id']
+                    )
+                else:
+                   configObject = logDeliveryConfigurationManager.createForAuditLogs(
+                        event['ResourceProperties']['config_name'],
+                        event['ResourceProperties']['credentials_id'],
+                        event['ResourceProperties']['storage_config_id']
+                    )
+                physicalResourceId = configObject.id
+            # deletion
+            elif event['RequestType'] == 'Delete':
+                logDeliveryConfigurationManager.delete(physicalResourceId)
 
         #### Workspace actions
 

@@ -30,6 +30,12 @@ Metadata:
           default: AWS PrivateLink Configuration
         Parameters:
           - PrivateLinkMode
+      - Label:
+          default: Log delivery configuration (Optional)
+        Parameters:
+          - BucketNameForBillableUsageLogs
+          - BucketNameForAuditLogs
+          - IAMRoleForLogDelivery
     ParameterLabels:
       AccountId:
         default: Databricks account ID
@@ -47,6 +53,12 @@ Metadata:
         default: Existing S3 bucket for data. Setting this to a non empty value will trigger the creation of an instance profile
       PrivateLinkMode:
         default: AWS PrivateLink mode
+      BucketNameForBillableUsageLogs:
+        default: S3 bucket name for the delivery of billable usage logs
+      BucketNameForAuditLogs:
+        default: S3 bucket name for the delivery of audit logs (Requires Premium Plan)
+      IAMRoleForLogDelivery:
+        default: Name of the IAM role for log delivery
 
 Outputs:
   DBManagedVPCIAMRoleARN:
@@ -128,6 +140,19 @@ Parameters:
       - 'Enabled'
       - 'Disabled'
     Default: 'Disabled'
+  BucketNameForBillableUsageLogs:
+    Description: Specify a name for the S3 bucket for storing the billable usage logs
+    Type: String
+    Default: ''
+  BucketNameForAuditLogs:
+    Description: Specify a name for the S3 bucket for storing the audit logs
+    Type: String
+    Default: ''
+  IAMRoleForLogDelivery:
+    Description: Specify a unique name for the IAM role that will be used for storing the logs
+    Type: String
+    Default: ''
+
 
 Conditions:
   # Checks if private link has been enabled
@@ -136,6 +161,12 @@ Conditions:
   IsThirdAvailabilityZoneSupported: !Not [!Or [!Equals [!Ref AWS::Region, 'us-west-1'], !Equals [!Ref AWS::Region, 'sa-east-1']]]
   # Checks whether it should create a default instance profile
   CreateDefaultInstanceProfile: !Not [!Equals [!Ref ExistingDataBucketName, '']]
+  # Checks if billable usage logs are set up
+  SetupBillableUsageLogs: !Not [!Equals [!Ref BucketNameForBillableUsageLogs, '']]
+  # Checks if audit logs are set up
+  SetupAuditLogs: !Not [!Equals [!Ref BucketNameForAuditLogs, '']]
+  # Checks if an IAM role for the log delivery needs to be created
+  CreateIAMRoleForLogDelivery: !Or [!Not [!Equals [!Ref BucketNameForBillableUsageLogs, '']], !Not [!Equals [!Ref BucketNameForAuditLogs, '']]]
 
 Rules:
   # Check whether the current AWS region is supported
@@ -157,6 +188,12 @@ Rules:
         - us-west-2
       - !Ref AWS::Region
       AssertDescription: The current AWS region is not supported for E2 deployment. Switch to one of those listed under https://docs.databricks.com/administration-guide/cloud-configurations/aws/regions.html
+
+  RoleForLogDelivery:
+    RuleCondition: !Or [!Not [!Equals [!Ref BucketNameForBillableUsageLogs, '']], !Not [!Equals [!Ref BucketNameForAuditLogs, '']]]
+    Assertions:
+    - Assert: !Not [!Equals [!Ref IAMRoleForLogDelivery, '']]
+      AssertDescription: IAM role name is required when setting up log delivery
 
 Resources:
   # The VPC
@@ -469,7 +506,7 @@ Resources:
               - kinesis:PutRecord
               - kinesis:PutRecords
               - kinesis:DescribeStream
-            Resource: !Sub arn:aws:kinesis:${AWS::Region}:414351767826:stream/*
+            Resource: !Sub arn:${AWS::Partition}:kinesis:${AWS::Region}:414351767826:stream/*
 
   WaitForVpc:
     Type: AWS::CloudFormation::WaitConditionHandle
@@ -828,6 +865,229 @@ Resources:
       password: !Ref Password
       workspace_deployment_name: !GetAtt createWorkspace.DeploymentName
       instance_profile_arn: !If [CreateDefaultInstanceProfile, !Ref registerInstanceProfile, !Ref AWS::NoValue]
+      user_agent: databricks-CloudFormation-Trial-provider
+
+  ## Log delivery
+
+  # Billable Usgage Logs
+  BillableUsageLogsBucket:
+    Condition: SetupBillableUsageLogs
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketNameForBillableUsageLogs
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+  BillableUsageLogsBucketPolicy:
+    Condition: SetupBillableUsageLogs
+    Type: 'AWS::S3::BucketPolicy'
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - EIAMAccountIDInPrincipal
+          ignore_reasons:
+            EIAMAccountIDInPrincipal: "Hardcoded account ID needed for configuration: https://docs.databricks.com/administration-guide/account-settings/aws-accounts.html#step-2-create-a-cross-account-role-and-an-access-policy"
+    Properties:     
+      PolicyDocument:
+        Id: BillableUsageLogsBucketPolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: Grant Databricks Access
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::414351767826:root
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub ${BillableUsageLogsBucket.Arn}/*
+              - !GetAtt BillableUsageLogsBucket.Arn
+      Bucket: !Ref BillableUsageLogsBucket
+
+  StorageConfigurationForBillableUsageLogs:
+    Condition: SetupBillableUsageLogs
+    Type: Custom::StorageConfigurationForBillableUsageLogs
+    Properties:
+      ServiceToken: !GetAtt databricksApiFunction.Arn
+      action: CREATE_STORAGE_CONFIGURATIONS
+      accountId: !Ref AccountId
+      username: !Ref Username
+      password: !Ref Password
+      storage_config_name: !Sub ${WorkspaceName}-storageForBillableUsageLogs
+      s3bucket_name: !Ref BillableUsageLogsBucket
+      user_agent: databricks-CloudFormation-Trial-provider
+
+  # Audit Logs
+  AuditLogsBucket:
+    Condition: SetupAuditLogs
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketNameForAuditLogs
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+  AuditLogsBucketPolicy:
+    Condition: SetupAuditLogs
+    Type: 'AWS::S3::BucketPolicy'
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - EIAMAccountIDInPrincipal
+          ignore_reasons:
+            EIAMAccountIDInPrincipal: "Hardcoded account ID needed for configuration: https://docs.databricks.com/administration-guide/account-settings/aws-accounts.html#step-2-create-a-cross-account-role-and-an-access-policy"
+    Properties:     
+      PolicyDocument:
+        Id: AuditLogsBucketPolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: Grant Databricks Access
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::414351767826:root
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub ${AuditLogsBucket.Arn}/*
+              - !GetAtt AuditLogsBucket.Arn
+      Bucket: !Ref AuditLogsBucket
+
+  StorageConfigurationForAuditLogs:
+    Condition: SetupAuditLogs
+    Type: Custom::StorageConfigurationForAuditLogs
+    Properties:
+      ServiceToken: !GetAtt databricksApiFunction.Arn
+      action: CREATE_STORAGE_CONFIGURATIONS
+      accountId: !Ref AccountId
+      username: !Ref Username
+      password: !Ref Password
+      storage_config_name: !Sub ${WorkspaceName}-storageForAuditLogs
+      s3bucket_name: !Ref AuditLogsBucket
+      user_agent: databricks-CloudFormation-Trial-provider
+
+  # The role for log delivery
+  RoleForLogDelivery:
+    Condition: CreateIAMRoleForLogDelivery
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref IAMRoleForLogDelivery
+      Path: /
+      Description: Role for the Databricks logs delivery
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Condition:
+              "StringEquals":
+                "sts:ExternalId": !Ref AccountId
+            Effect: Allow
+            Principal:
+              "AWS": "arn:aws:iam::414351767826:role/SaasUsageDeliveryRole-prod-IAMRole-3PLHICCRR1TK"
+      Policies:
+        - PolicyName: !Sub ${IAMRoleForLogDelivery}-Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PoliciesForLogsDelivery
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:PutObjectAcl
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucket
+                  - s3:ListMultipartUploadParts
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !If [SetupBillableUsageLogs, !GetAtt BillableUsageLogsBucket.Arn, !Ref AWS::NoValue]
+                  - !If
+                    - SetupBillableUsageLogs
+                    - !Sub ${BillableUsageLogsBucket.Arn}/*
+                    - !Ref AWS::NoValue
+                  - !If [SetupAuditLogs, !GetAtt AuditLogsBucket.Arn, !Ref AWS::NoValue]
+                  - !If
+                    - SetupAuditLogs
+                    - !Sub ${AuditLogsBucket.Arn}/*
+                    - !Ref AWS::NoValue
+
+  # Credentials for billable usage logs
+  CredentialsForBillableUsageLogs:
+    Condition: SetupBillableUsageLogs
+    Type: Custom::CredentialsForBillableUsageLogs
+    Properties:
+      ServiceToken: !GetAtt databricksApiFunction.Arn
+      action: CREATE_CREDENTIALS
+      accountId: !Ref AccountId
+      username: !Ref Username
+      password: !Ref Password
+      credentials_name: !Sub ${WorkspaceName}-credentialsForBillableUsageLogs
+      role_arn: !GetAtt RoleForLogDelivery.Arn
+      user_agent: databricks-CloudFormation-Trial-provider
+
+  # Credentials for audit logs
+  CredentialsForAuditLogs:
+    Condition: SetupAuditLogs
+    Type: Custom::CredentialsForAuditLogs
+    Properties:
+      ServiceToken: !GetAtt databricksApiFunction.Arn
+      action: CREATE_CREDENTIALS
+      accountId: !Ref AccountId
+      username: !Ref Username
+      password: !Ref Password
+      credentials_name: !Sub ${WorkspaceName}-credentialsForAuditLogs
+      role_arn: !GetAtt RoleForLogDelivery.Arn
+      user_agent: databricks-CloudFormation-Trial-provider
+
+  # Billable Usage Logs Configuration
+  BillableUsageLogsConfiguration:
+    Condition: SetupBillableUsageLogs
+    Type: Custom::BillableUsageLogsConfiguration
+    Properties:
+      ServiceToken: !GetAtt databricksApiFunction.Arn
+      action: CREATE_BILLABLE_USAGE_LOGS_CONFIGURATION
+      accountId: !Ref AccountId
+      username: !Ref Username
+      password: !Ref Password
+      config_name: !Sub ${WorkspaceName}-BillableUsageLogsConfiguration
+      credentials_id: !Ref CredentialsForBillableUsageLogs
+      storage_config_id: !Ref StorageConfigurationForBillableUsageLogs
+      user_agent: databricks-CloudFormation-Trial-provider
+
+  # Audit Logs Configuration
+  AuditLogsConfiguration:
+    Condition: SetupAuditLogs
+    Type: Custom::AuditLogsConfiguration
+    Properties:
+      ServiceToken: !GetAtt databricksApiFunction.Arn
+      action: CREATE_AUDIT_LOGS_CONFIGURATION
+      accountId: !Ref AccountId
+      username: !Ref Username
+      password: !Ref Password
+      config_name: !Sub ${WorkspaceName}-AuditLogsConfiguration
+      credentials_id: !Ref CredentialsForAuditLogs
+      storage_config_id: !Ref StorageConfigurationForAuditLogs
       user_agent: databricks-CloudFormation-Trial-provider
 
   # The Lambda for the custom resources

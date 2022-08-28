@@ -20,9 +20,17 @@ class LogDeliveryConfiguration:
 class LogDeliveryConfigurationManager:
   def __init__(self, apiSession: AccountApiSession):
     self.__apiSession = apiSession
+  
+  # Creates a new configuration object for billable usage log delivery
+  def createForBillableUsageLogs(self, name: str, credentialsId: str, storageId: str):
+    return self.__create( name, "BILLABLE_USAGE", "CSV", credentialsId, storageId)
+
+  # Creates a new configuration object for billable usage log delivery
+  def createForAuditLogs(self, name: str, credentialsId: str, storageId: str):
+    return self.__create( name, "AUDIT_LOGS", "JSON", credentialsId, storageId)
 
   # Creates a new log delivery configuration object
-  def create(self, name: str, logType: str, outputFormat: str, credentialsId: str, storageId: str,
+  def __create(self, name: str, logType: str, outputFormat: str, credentialsId: str, storageId: str,
     enabled: bool = True, workspaceIds: list = [], deliveryPathPrefix: str = None, deliveryStartTime: str = None):
     postData = {
       "config_name": name,
@@ -49,7 +57,7 @@ class LogDeliveryConfigurationManager:
 
   # Deletes an existing log delivery configuration using its id
   def delete(self, configId: str):
-    self.__apiSession.delete('/log-delivery/' + configId)
+    _ = self.enableDelivery(configId, False)
 
 
   # Retrieves an existing log delivery configuration using its id
